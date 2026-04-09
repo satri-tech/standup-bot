@@ -156,14 +156,57 @@ async function startStandup() {
     await channel.send(`📨 Sent standup questions to ${sentCount}/${targetUsers.length} users`);
 
     // Set timeout for responses
-    const timeoutDuration = standupConfig.testMode ? 60 * 1000 : 2 * 60 * 60 * 1000; // 1 min test, 2 hours production
-    const timeoutMessage = standupConfig.testMode ? "1 minute" : "2 hours";
+    // const timeoutDuration = standupConfig.testMode ? 60 * 1000 : 2 * 60 * 60 * 1000; // 1 min test, 2 hours production
+    // const timeoutMessage = standupConfig.testMode ? "1 minute" : "2 hours";
+
+
+    const timeoutDuration = standupConfig.testMode ? 60 * 1000 : 30 * 60 * 1000; // 1 min test, 30 minutes production
+    const timeoutMessage = standupConfig.testMode ? "1 minute" : "30 minutes";
 
     await channel.send(`⏰ Waiting for responses (${timeoutMessage})...`);
 
     setTimeout(async () => {
         await generateReport(channel, standupDate, targetUsers);
     }, timeoutDuration);
+}
+
+
+async function reconstructFromDMs(member, standupDate) {
+    try {
+        const dmChannel = await member.user.createDM();
+        const fetched = await dmChannel.messages.fetch({ limit: 100 });
+        const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+        // Find the most recent standup initiation from the bot on standupDate
+        let startIdx = -1;
+        for (let i = sorted.length - 1; i >= 0; i--) {
+            const msg = sorted[i];
+            if (
+                msg.author.id === client.user.id &&
+                msg.content.includes('Daily Standup Time') &&
+                msg.createdAt.toISOString().split('T')[0] === standupDate
+            ) {
+                startIdx = i;
+                break;
+            }
+        }
+
+        if (startIdx === -1) return null;
+
+        // Collect user messages sent after the bot's initiation message
+        const userAnswers = sorted.slice(startIdx + 1).filter(msg => msg.author.id === member.user.id);
+        if (userAnswers.length === 0) return null;
+
+        const answers = {};
+        if (userAnswers[0]) answers.yesterday = userAnswers[0].content;
+        if (userAnswers[1]) answers.today = userAnswers[1].content;
+        if (userAnswers[2]) answers.blockers = userAnswers[2].content;
+
+        return { answers, count: userAnswers.length };
+    } catch (err) {
+        console.log(`Could not reconstruct DMs for ${member.user.username}: ${err.message}`);
+        return null;
+    }
 }
 
 async function generateReport(channel, standupDate, targetUsers) {
@@ -218,7 +261,24 @@ async function generateReport(channel, standupDate, targetUsers) {
     if (partialList.length > 0) report += ` | ${partialList.length} partial`;
     if (missingList.length > 0) report += ` | ${missingList.length} missing`;
 
-    await channel.send(report);
+    // Split report into ≤2000-char chunks on newline boundaries
+    const MAX_LEN = 2000;
+    const chunks = [];
+    let current = '';
+    for (const line of report.split('\n')) {
+        const addition = (current.length ? '\n' : '') + line;
+        if (current.length + addition.length > MAX_LEN) {
+            chunks.push(current);
+            current = line;
+        } else {
+            current += addition;
+        }
+    }
+    if (current.length) chunks.push(current);
+
+    for (const chunk of chunks) {
+        await channel.send(chunk);
+    }
     console.log("📊 Report generated and sent");
 
     // Clean up old sessions
@@ -389,9 +449,44 @@ client.on('messageCreate', async (message) => {
             if (standupConfig.testMode) {
                 await message.reply("⚠️ Disable test mode first: `!test-mode`");
             } else {
-                await message.reply("🚀 **Force starting standup...**\n⏰ Responses will be collected for 2 hours");
+                await message.reply("🚀 **Force starting standup...**\n⏰ Responses will be collected for 30 minutes");
                 await startStandup();
             }
+        }
+
+        if (command === '!force-report') {
+            const standupDate = new Date().toISOString().split('T')[0];
+            const reportChannel = await client.channels.fetch(process.env.CHANNEL_ID);
+            const targetUsers = await getTargetUsers();
+            await message.reply("🔍 **Scanning DM history and generating report...**");
+
+            // Recover sessions from DM history for users who haven't submitted
+            let reconstructed = 0;
+            for (const member of targetUsers) {
+                const existing = userSessions.get(member.id);
+                const alreadyComplete = existing &&
+                    existing.standupDate === standupDate &&
+                    Object.keys(existing.answers).length === 3;
+
+                if (!alreadyComplete) {
+                    const result = await reconstructFromDMs(member, standupDate);
+                    if (result && result.count > 0) {
+                        userSessions.set(member.id, {
+                            step: result.count,
+                            answers: result.answers,
+                            standupDate: standupDate,
+                            username: member.user.username
+                        });
+                        reconstructed++;
+                    }
+                }
+            }
+
+            if (reconstructed > 0) {
+                await message.reply(`✅ Recovered **${reconstructed}** submission(s) from DM history`);
+            }
+
+            await generateReport(reportChannel, standupDate, targetUsers);
         }
 
         if (command === '!status') {
@@ -399,20 +494,20 @@ client.on('messageCreate', async (message) => {
             const mode = standupConfig.testMode ? "🧪 TEST MODE" : "⚙️ PRODUCTION";
             const time = `${standupConfig.hour.toString().padStart(2, '0')}:${standupConfig.minute.toString().padStart(2, '0')}`;
 
-            let message = `**📊 Standup Bot Status**\n\n`;
-            message += `└ Mode: ${mode}\n`;
-            message += `└ Status: ${status}\n`;
-            message += `└ Time: ${time}\n`;
+            let statusMsg = `**📊 Standup Bot Status**\n\n`;
+            statusMsg += `└ Mode: ${mode}\n`;
+            statusMsg += `└ Status: ${status}\n`;
+            statusMsg += `└ Time: ${time}\n`;
 
             if (standupConfig.testMode) {
-                message += `└ Test Users: ${standupConfig.testUsers.length}\n`;
+                statusMsg += `└ Test Users: ${standupConfig.testUsers.length}\n`;
             } else {
-                message += `└ Role ID: ${process.env.ROLE_ID || 'Not set'}\n`;
+                statusMsg += `└ Role ID: ${process.env.ROLE_ID || 'Not set'}\n`;
             }
 
-            message += `└ Report Channel: ${process.env.CHANNEL_ID || 'Not set'}\n`;
+            statusMsg += `└ Report Channel: ${process.env.CHANNEL_ID || 'Not set'}\n`;
 
-            await message.reply(message);
+            await message.reply(statusMsg);
         }
 
         if (command === '!help') {
@@ -432,6 +527,7 @@ client.on('messageCreate', async (message) => {
 \`!enable\` - Enable automatic standup
 \`!disable\` - Disable automatic standup
 \`!force-start\` - Manually start standup
+\`!force-report\` - Send report immediately (skips timeout)
 
 **ℹ️ Info Commands:**
 \`!status\` - Show bot status and settings
