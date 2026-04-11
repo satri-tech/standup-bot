@@ -17,9 +17,9 @@ const client = new Client({
 // Store user sessions
 const userSessions = new Map();
 let standupConfig = {
-    hour: 10,
+    hour: 12,
     minute: 0,
-    cronSchedule: '0 10 * * *',
+    cronSchedule: '0 12 * * *',
     enabled: false, // Start disabled until configured
     testMode: false,
     testUsers: []
@@ -118,6 +118,12 @@ async function getTargetUsers() {
 }
 
 async function startStandup() {
+    const today = new Date();
+    if (today.getDay() === 6) { // 6 = Saturday
+        console.log("⏭️ Skipping standup – Saturday is a holiday.");
+        return;
+    }
+
     console.log("🚀 Starting standup...");
 
     const channel = await client.channels.fetch(process.env.CHANNEL_ID);
