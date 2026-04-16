@@ -2,6 +2,7 @@
   "hour": 12,
   "minute": 0,
   "cronSchedule": "0 12 * * *",
+  "timezone": "Asia/Kathmandu",
   "enabled": true,
   "testMode": false,
   "testUsers": []

@@ -20,6 +20,7 @@ let standupConfig = {
     hour: 12,
     minute: 0,
     cronSchedule: '0 12 * * *',
+    timezone: 'Asia/Kathmandu', // Set your server's local timezone (e.g. 'America/New_York', 'Europe/London')
     enabled: false, // Start disabled until configured
     testMode: false,
     testUsers: []
@@ -53,6 +54,7 @@ function saveConfig() {
 }
 
 let currentJob = null;
+let pendingReportTimeout = null; // Track pending auto-report so we can cancel it
 
 function updateCronJob() {
     if (currentJob) {
@@ -63,8 +65,8 @@ function updateCronJob() {
         currentJob = cron.schedule(standupConfig.cronSchedule, async () => {
             console.log("🚀 Starting scheduled standup...");
             await startStandup();
-        });
-        console.log(`✅ Standup scheduled at ${standupConfig.hour}:${standupConfig.minute.toString().padStart(2, '0')}`);
+        }, { timezone: standupConfig.timezone });
+        console.log(`✅ Standup scheduled at ${standupConfig.hour}:${standupConfig.minute.toString().padStart(2, '0')} (${standupConfig.timezone})`);
     } else if (standupConfig.testMode) {
         console.log("🧪 Test mode enabled - automatic standups disabled");
     } else {
@@ -124,6 +126,12 @@ async function startStandup() {
         return;
     }
 
+    // Guard: prevent double-start if a standup is already in progress
+    if (pendingReportTimeout !== null) {
+        console.log("⚠️ Standup already in progress — skipping duplicate start.");
+        return;
+    }
+
     console.log("🚀 Starting standup...");
 
     const channel = await client.channels.fetch(process.env.CHANNEL_ID);
@@ -171,7 +179,8 @@ async function startStandup() {
 
     await channel.send(`⏰ Waiting for responses (${timeoutMessage})...`);
 
-    setTimeout(async () => {
+    pendingReportTimeout = setTimeout(async () => {
+        pendingReportTimeout = null;
         await generateReport(channel, standupDate, targetUsers);
     }, timeoutDuration);
 }
@@ -429,7 +438,22 @@ client.on('messageCreate', async (message) => {
                 standupConfig.cronSchedule = `${minute} ${hour} * * *`;
                 saveConfig();
                 updateCronJob();
-                await message.reply(`✅ Standup scheduled for **${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}** daily`);
+                await message.reply(`✅ Standup scheduled for **${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}** daily (${standupConfig.timezone})`);
+            }
+        }
+
+        if (command === '!set-timezone' && args[1]) {
+            const tz = args[1];
+            // Validate timezone by checking if cron accepts it
+            try {
+                const testJob = cron.schedule('0 0 * * *', () => {}, { timezone: tz, scheduled: false });
+                testJob.stop();
+                standupConfig.timezone = tz;
+                saveConfig();
+                updateCronJob();
+                await message.reply(`✅ Timezone set to **${tz}**\nStandup will fire at ${standupConfig.hour.toString().padStart(2, '0')}:${standupConfig.minute.toString().padStart(2, '0')} in that timezone.`);
+            } catch {
+                await message.reply(`❌ Invalid timezone: \`${tz}\`\nUse a valid IANA timezone, e.g. \`Asia/Kathmandu\`, \`America/New_York\`, \`Europe/London\``);  
             }
         }
 
@@ -465,6 +489,13 @@ client.on('messageCreate', async (message) => {
             const reportChannel = await client.channels.fetch(process.env.CHANNEL_ID);
             const targetUsers = await getTargetUsers();
             await message.reply("🔍 **Scanning DM history and generating report...**");
+
+            // Cancel any pending auto-report timeout to avoid duplicate reports
+            if (pendingReportTimeout !== null) {
+                clearTimeout(pendingReportTimeout);
+                pendingReportTimeout = null;
+                console.log("🔔 Cancelled pending auto-report timeout (force-report used)");
+            }
 
             // Recover sessions from DM history for users who haven't submitted
             let reconstructed = 0;
@@ -504,6 +535,8 @@ client.on('messageCreate', async (message) => {
             statusMsg += `└ Mode: ${mode}\n`;
             statusMsg += `└ Status: ${status}\n`;
             statusMsg += `└ Time: ${time}\n`;
+            statusMsg += `└ Timezone: ${standupConfig.timezone}\n`;
+            statusMsg += `└ Pending Report: ${pendingReportTimeout !== null ? '⏳ Yes' : 'None'}\n`;
 
             if (standupConfig.testMode) {
                 statusMsg += `└ Test Users: ${standupConfig.testUsers.length}\n`;
@@ -530,6 +563,7 @@ client.on('messageCreate', async (message) => {
 
 **⚙️ Setup Commands:**
 \`!set-time HH MM\` - Set daily standup time (24h)
+\`!set-timezone <tz>\` - Set timezone (e.g. Asia/Kathmandu)
 \`!enable\` - Enable automatic standup
 \`!disable\` - Disable automatic standup
 \`!force-start\` - Manually start standup
